@@ -1,0 +1,33 @@
+# TRADE-Crypto Configuration
+
+freqtrade:
+  api_url: "http://127.0.0.1:18798"
+  username: "freqtrade"
+  password: "freqtrade123"
+
+binance:
+  base_url: "https://api.binance.com/api/v3"
+
+scanning:
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "BNBUSDT"
+    - "SOLUSDT"
+    - "XRPUSDT"
+    - "ADAUSDT"
+    - "DOGEUSDT"
+    - "AVAXUSDT"
+    - "DOTUSDT"
+    - "LINKUSDT"
+  interval: "15m"
+  limit: 100
+
+decision:
+  max_position_size: 0.05  # 5%
+  default_stop_loss: 0.05   # 5%
+  default_take_profit: 0.10  # 10%
+  
+risk:
+  max_open_trades: 3
+  max_daily_trades: 5
