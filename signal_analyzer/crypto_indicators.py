@@ -8,9 +8,7 @@ from typing import List, Dict, Optional
 
 def calc_ema(values: List[float], period: int) -> List[float]:
     """計算 EMA（忽略 None 值）"""
-    # 先過濾 None
-    clean = [v for v in values if v is not None]
-    if len(clean) < period:
+    if len(values) < period:
         return [None] * len(values)
     
     k = 2 / (period + 1)
@@ -18,15 +16,23 @@ def calc_ema(values: List[float], period: int) -> List[float]:
     
     # 找到第一個有效位置
     first_valid_idx = next((i for i, v in enumerate(values) if v is not None), -1)
-    if first_valid_idx >= period - 1:
-        result[period - 1] = values[period - 1]
-        prev_ema = values[period - 1]
-        
-        for i in range(period, len(values)):
-            if values[i] is not None:
-                ema_val = values[i] * k + prev_ema * (1 - k)
-                result[i] = ema_val
-                prev_ema = ema_val
+    if first_valid_idx == -1:
+        return [None] * len(values)
+    
+    # 從第一個有效位置 + period - 1 開始計算
+    start_idx = first_valid_idx + period - 1
+    if start_idx >= len(values):
+        return [None] * len(values)
+    
+    # 初始化：第一個 EMA 值
+    result[start_idx] = values[start_idx]
+    prev_ema = values[start_idx]
+    
+    for i in range(start_idx + 1, len(values)):
+        if values[i] is not None:
+            ema_val = values[i] * k + prev_ema * (1 - k)
+            result[i] = ema_val
+            prev_ema = ema_val
     
     return result
 
