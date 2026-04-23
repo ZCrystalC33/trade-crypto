@@ -34,10 +34,8 @@ class AIDecisionRequest:
     context: Dict
     
     def to_prompt(self) -> str:
-        """轉換為自然語言 Prompt"""
-        
-        # 格式化技術指標
-        tech_lines = []
+        """轉換為簡潔 Prompt"""
+        tech_parts = []
         for name, ind in self.indicators.items():
             if isinstance(ind, dict):
                 val = ind.get("value", ind.get("signal", "N/A"))
@@ -45,50 +43,29 @@ class AIDecisionRequest:
             else:
                 val = ind
                 sig = ""
-            tech_lines.append(f"- {name}: {val} ({sig})")
-        tech_text = "\n".join(tech_lines) if tech_lines else "無數據"
+            tech_parts.append(f"{name}={val}({sig})")
+        tech_text = ", ".join(tech_parts) if tech_parts else "無"
         
-        # 格式化情緒
-        sent_lines = []
+        sent_parts = []
         if self.sentiment.get("ticker"):
             t = self.sentiment["ticker"]
-            sent_lines.append(f"- 24h 價格變化: {t.get('price_change_pct', 0):.2f}%")
-            sent_lines.append(f"- 24h 成交量: ${t.get('quote_volume', 0):,.0f}")
+            sent_parts.append(f"24h{float(t.get('price_change_pct',0)):.1f}%")
+            sent_parts.append(f"量${float(t.get('quote_volume',0))/1e9:.1f}B")
         if self.sentiment.get("funding_rate") is not None:
             fr = self.sentiment["funding_rate"]
-            sent_lines.append(f"- 資金费率: {fr*100:.4f}%")
+            sent_parts.append(f"資金费{fr*100:.3f}%")
         if self.sentiment.get("orderbook_imbalance") is not None:
             imb = self.sentiment["orderbook_imbalance"]
-            bias = "偏多" if imb > 0 else "偏空"
-            sent_lines.append(f"- 掛單失衡: {abs(imb)*100:.1f}% {bias}")
-        sent_text = "\n".join(sent_lines) if sent_lines else "無數據"
+            sent_parts.append(f"掛單{'多' if imb>0 else '空'}{abs(imb)*100:.0f}%")
+        sent_text = ", ".join(sent_parts) if sent_parts else "無"
         
-        prompt = f"""分析這個加密貨幣交易情境並給出決策：
-
-幣種: {self.symbol}
-現價: ${self.price:,.2f}
-
-Layer 1 分析結果：
-- 初步決策: {self.layer1_decision}
-- 信心程度: {self.layer1_confidence*100:.0f}%
-- 分數: {self.layer1_score:.1f}/100
-- 觸發信號: {', '.join(self.layer1_signals) if self.layer1_signals else '無'}
-
-技術指標：
-{tech_text}
-
-市場情緒：
-{sent_text}
-
-請用繁體中文回答：
-1. 你的交易決策是什麼？（BUY、SELL 或 HOLD）
-2. 為什麼？
-3. 信心程度（高、中、低）
-4. 風險等級（高、中、低）
-5. 建議停損價位（可選）
-6. 建議停利價位（可選）
-"""
-        return prompt
+        return (f"幣種：{self.symbol} | 現價：${self.price:,.2f} | "
+                f"Layer1：{self.layer1_decision} 信心{self.layer1_confidence*100:.0f}% "
+                f"[{','.join(self.layer1_signals) if self.layer1_signals else '無'}] | "
+                f"指標：{tech_text} | 情緒：{sent_text}\n\n"
+                f"直接給出結論：決策(BUY/SELL/HOLD)、原因、信心(高/中/低)、"
+                f"風險(高/中/低)、停損價、停利價。\n"
+                f"格式：「決策：X | 原因：... | 信心：高 | 風險：中 | 停損：X | 停利：X」")
 
 
 class MiniMaxClient:
@@ -118,7 +95,7 @@ class MiniMaxClient:
         payload = {
             "model": model,
             "messages": messages,
-            "max_tokens": 1000
+            "max_tokens": 600
         }
         
         try:
@@ -138,6 +115,76 @@ class MiniMaxClient:
         except Exception as e:
             print(f"MiniMax API Error: {e}")
             return None
+
+
+def parse_structured_response(response: str) -> Optional[Dict]:
+    """嘗試解析結構化回應格式「決策：X | 原因：...」"""
+    try:
+        result = {"action": "HOLD", "confidence": 0.5, "reason": "", "risk_level": "MEDIUM", "stop_loss": None, "take_profit": None}
+        
+        # 解析結構化格式
+        if "決策：" in response:
+            match = re.search(r'決策[：:]\s*(BUY|SELL|HOLD)', response.upper())
+            if match:
+                result["action"] = match.group(1)
+        
+        if "原因：" in response or "原因:" in response:
+            match = re.search(r'原因[：:]\s*(.+?)(?=\||\n|$)', response)
+            if match:
+                result["reason"] = match.group(1).strip()[:200]
+        
+        # 解析信心
+        if "信心" in response:
+            if any(c in response for c in ["信心：高", "信心：高", "信心高"]):
+                result["confidence"] = 0.8
+            elif any(c in response for c in ["信心：中", "信心：中", "信心中"]):
+                result["confidence"] = 0.6
+            elif any(c in response for c in ["信心：低", "信心：低", "信心低"]):
+                result["confidence"] = 0.4
+        
+        # 解析風險
+        if "風險" in response:
+            if any(c in response for c in ["風險：低", "風險：低", "風險低", "risk=LOW"]):
+                result["risk_level"] = "LOW"
+            elif any(c in response for c in ["風險：高", "風險：高", "風險高", "risk=HIGH"]):
+                result["risk_level"] = "HIGH"
+        
+        # 解析停損停利
+        sl_match = re.search(r'停損[：:]\s*(\d+[\d,]*)', response)
+        if sl_match:
+            result["stop_loss"] = float(sl_match.group(1).replace(',', ''))
+        
+        tp_match = re.search(r'停利[：:]\s*(\d+[\d,]*)', response)
+        if tp_match:
+            result["take_profit"] = float(tp_match.group(1).replace(',', ''))
+        
+        return result
+    except:
+        return None
+
+
+def parse_fallback_response(response: str) -> Dict:
+    """備用解析：簡單搜索關鍵詞"""
+    result = {"action": "HOLD", "confidence": 0.5, "reason": response[:200], "risk_level": "MEDIUM", "stop_loss": None, "take_profit": None}
+    
+    # 找 BUY/SELL/HOLD
+    action_match = re.search(r'\b(BUY|SELL|HOLD)\b', response.upper())
+    if action_match:
+        result["action"] = action_match.group(1)
+    
+    # 簡單信心估計
+    if any(c in response for c in ["很確定", "沒問題", "高信心"]):
+        result["confidence"] = 0.8
+    elif any(c in response for c in ["不太確定", "觀望", "低信心"]):
+        result["confidence"] = 0.4
+    
+    # 簡單風險估計
+    if "風險高" in response or "危險" in response:
+        result["risk_level"] = "HIGH"
+    elif "風險低" in response or "安全" in response:
+        result["risk_level"] = "LOW"
+    
+    return result
 
 
 class Layer2AIDecider:
@@ -198,11 +245,11 @@ class Layer2AIDecider:
         return results
     
     def _call_ai(self, request: AIDecisionRequest) -> Optional[Dict]:
-        """調用 AI - 從自然語言回應中提取決策"""
+        """調用 AI"""
         prompt = request.to_prompt()
         
         messages = [
-            {"role": "system", "content": "你是一個專業的加密貨幣交易分析師。"},
+            {"role": "system", "content": "你是一個專業的加密貨幣交易分析師。直接給出結論，不要長篇分析。"},
             {"role": "user", "content": prompt}
         ]
         
@@ -211,55 +258,12 @@ class Layer2AIDecider:
         if not response:
             return None
         
-        # 從回應中提取決策
-        try:
-            # 找 BUY/SELL/HOLD
-            action_match = re.search(r'(BUY|SELL|HOLD)', response.upper())
-            action = action_match.group(1) if action_match else "HOLD"
-            
-            # 估計信心程度
-            confidence = 0.5
-            if "信心" in response:
-                if any(c in response for c in ["信心程度 高", "信心: 高", "信心高"]):
-                    confidence = 0.8
-                elif any(c in response for c in ["信心程度 中", "信心: 中", "信心中"]):
-                    confidence = 0.6
-                elif any(c in response for c in ["信心程度 低", "信心: 低", "信心低"]):
-                    confidence = 0.4
-            
-            # 估計風險等級
-            risk_level = "MEDIUM"
-            if "風險" in response:
-                if any(c in response for c in ["風險 低", "風險: 低", "風險低", "LOW"]):
-                    risk_level = "LOW"
-                elif any(c in response for c in ["風險 高", "風險: 高", "風險高", "HIGH"]):
-                    risk_level = "HIGH"
-            
-            # 嘗試找停損/停利
-            stop_loss = None
-            take_profit = None
-            
-            sl_match = re.search(r'停損.*?(\d+[\d,]*)', response)
-            if sl_match:
-                stop_loss = float(sl_match.group(1).replace(',', ''))
-            
-            tp_match = re.search(r'停利.*?(\d+[\d,]*)', response)
-            if tp_match:
-                take_profit = float(tp_match.group(1).replace(',', ''))
-            
-            return {
-                "action": action,
-                "confidence": confidence,
-                "reason": response[:500],
-                "risk_level": risk_level,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit
-            }
-            
-        except Exception as e:
-            print(f"Parse Error: {e}")
-            print(f"Response: {response[:300]}")
-            return None
+        # 解析回應
+        result = parse_structured_response(response)
+        if result:
+            return result
+        
+        return parse_fallback_response(response)
 
 
 # ============================================================
@@ -378,7 +382,7 @@ class DualLayerTradingSystem:
         if ai_decs:
             for c in ai_decs:
                 lines.append(f"  【{c.final_decision}】{c.symbol} @ ${c.price:,.2f}")
-                lines.append(f"    AI 原因: {c.final_reason[:150]}...")
+                lines.append(f"    AI 原因: {c.final_reason[:100]}")
                 lines.append(f"    信心: {c.final_confidence:.0%} | 風險: {getattr(c, 'risk_level', 'MEDIUM')}")
                 if hasattr(c, 'stop_loss') and c.stop_loss and c.take_profit:
                     lines.append(f"    停損: ${c.stop_loss:,.2f} | 停利: ${c.take_profit:,.2f}")
