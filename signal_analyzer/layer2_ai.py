@@ -4,12 +4,30 @@ Layer 2 AI Decision Module - AI 裁決引擎
 使用 MiniMax API 進行智能決策
 """
 
-import json
 import re
+import os
 import requests
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from datetime import datetime
+
+
+class APIKeyLoadError(Exception):
+    """API Key 載入失敗"""
+    pass
+
+
+class MiniMaxAPIError(Exception):
+    """MiniMax API 錯誤"""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"MiniMax API Error {status_code}: {message}")
+
+
+class AIResponseParseError(Exception):
+    """AI 回應解析錯誤"""
+    pass
 
 
 @dataclass
@@ -73,11 +91,22 @@ class MiniMaxClient:
     
     def __init__(self, api_key: str = None):
         if api_key is None:
+            key_path = os.path.expanduser("~/.openclaw/credentials/minimax.key")
             try:
-                with open("/home/snow/.openclaw/credentials/minimax.key") as f:
+                with open(key_path) as f:
                     api_key = f.read().strip()
-            except:
-                pass
+                
+                # 檢查檔案權限
+                stat = os.stat(key_path)
+                mode = stat.st_mode & 0o777
+                if mode & 0o077:  # 群組或其他人有讀寫權限
+                    print(f"Warning: {key_path} has insecure permissions {oct(mode)}")
+            except FileNotFoundError:
+                raise APIKeyLoadError(f"Key file not found: {key_path}")
+            except PermissionError:
+                raise APIKeyLoadError(f"Permission denied: {key_path}")
+            except OSError as e:
+                raise APIKeyLoadError(f"Failed to read key: {e}")
         
         self.api_key = api_key
         self.base_url = "https://api.minimax.io/v1"
@@ -110,17 +139,31 @@ class MiniMaxClient:
                 data = resp.json()
                 return data.get("choices", [{}])[0].get("message", {}).get("content")
             else:
-                print(f"MiniMax API Error: {resp.status_code} - {resp.text}")
-                return None
+                raise MiniMaxAPIError(resp.status_code, resp.text)
+        except requests.Timeout:
+            raise MiniMaxAPIError(408, "Request timeout")
+        except requests.ConnectionError as e:
+            raise MiniMaxAPIError(0, f"Connection error: {e}")
+        except MiniMaxAPIError:
+            raise
         except Exception as e:
-            print(f"MiniMax API Error: {e}")
-            return None
+            raise MiniMaxAPIError(0, f"Unexpected error: {e}")
 
 
 def parse_structured_response(response: str) -> Optional[Dict]:
     """嘗試解析結構化回應格式「決策：X | 原因：...」"""
+    if not response:
+        return None
+    
     try:
-        result = {"action": "HOLD", "confidence": 0.5, "reason": "", "risk_level": "MEDIUM", "stop_loss": None, "take_profit": None}
+        result = {
+            "action": "HOLD",
+            "confidence": 0.5,
+            "reason": "",
+            "risk_level": "MEDIUM",
+            "stop_loss": None,
+            "take_profit": None
+        }
         
         # 解析結構化格式
         if "決策：" in response:
@@ -159,13 +202,30 @@ def parse_structured_response(response: str) -> Optional[Dict]:
             result["take_profit"] = float(tp_match.group(1).replace(',', ''))
         
         return result
-    except:
-        return None
+    except (re.error, ValueError, TypeError) as e:
+        raise AIResponseParseError(f"Failed to parse response: {e}")
 
 
 def parse_fallback_response(response: str) -> Dict:
     """備用解析：簡單搜索關鍵詞"""
-    result = {"action": "HOLD", "confidence": 0.5, "reason": response[:200], "risk_level": "MEDIUM", "stop_loss": None, "take_profit": None}
+    if not response:
+        return {
+            "action": "HOLD",
+            "confidence": 0.5,
+            "reason": "Empty response",
+            "risk_level": "MEDIUM",
+            "stop_loss": None,
+            "take_profit": None
+        }
+    
+    result = {
+        "action": "HOLD",
+        "confidence": 0.5,
+        "reason": response[:200],
+        "risk_level": "MEDIUM",
+        "stop_loss": None,
+        "take_profit": None
+    }
     
     # 找 BUY/SELL/HOLD
     action_match = re.search(r'\b(BUY|SELL|HOLD)\b', response.upper())
@@ -192,7 +252,7 @@ class Layer2AIDecider:
     
     def __init__(self, api_key: str = None):
         self.minimax = MiniMaxClient(api_key)
-        self.decision_history = []
+        self.decision_history: List[Dict] = []
     
     def decide(self, candidates: List, binance_provider = None) -> List:
         """對矛盾候選做 AI 裁決"""
@@ -253,15 +313,22 @@ class Layer2AIDecider:
             {"role": "user", "content": prompt}
         ]
         
-        response = self.minimax.chat(messages)
+        try:
+            response = self.minimax.chat(messages)
+        except MiniMaxAPIError as e:
+            print(f"MiniMax API Error: {e}")
+            return None
         
         if not response:
             return None
         
         # 解析回應
-        result = parse_structured_response(response)
-        if result:
-            return result
+        try:
+            result = parse_structured_response(response)
+            if result:
+                return result
+        except AIResponseParseError:
+            pass
         
         return parse_fallback_response(response)
 
@@ -281,16 +348,21 @@ class DualLayerTradingSystem:
     
     def __init__(self, binance_api_key: str = None, binance_secret: str = None):
         if binance_api_key is None:
+            key_path = os.path.expanduser("~/.openclaw/credentials/binance.key")
             try:
-                with open("/home/snow/.openclaw/credentials/binance.key") as f:
+                with open(key_path) as f:
                     lines = f.readlines()
                     for line in lines:
                         if "BINANCE_API_KEY=" in line:
                             binance_api_key = line.split("=")[1].strip()
                         elif "BINANCE_API_SECRET=" in line:
                             binance_secret = line.split("=")[1].strip()
-            except:
-                pass
+            except FileNotFoundError:
+                print(f"Warning: {key_path} not found, Binance API disabled")
+            except PermissionError:
+                print(f"Warning: Permission denied: {key_path}")
+            except OSError as e:
+                print(f"Warning: Failed to read {key_path}: {e}")
         
         self.binance = None
         if binance_api_key:

@@ -6,9 +6,30 @@ Binance API Provider - 增強版數據源
 import hmac
 import hashlib
 import time
+import os
 import requests
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TypedDict
 from datetime import datetime
+
+
+class BinanceAPIError(Exception):
+    """Binance API 錯誤"""
+    def __init__(self, status_code: int, message: str):
+        self.status_code = status_code
+        self.message = message
+        super().__init__(f"Binance API Error {status_code}: {message}")
+
+
+class Kline(TypedDict):
+    """K線數據結構"""
+    open_time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: datetime
+    quote_volume: float
 
 
 class BinanceProvider:
@@ -30,7 +51,14 @@ class BinanceProvider:
         self.api_secret = api_secret
         self.testnet = testnet
         
+        # 配置連接池復用
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=3
+        )
         self.session = requests.Session()
+        self.session.mount("https://", adapter)
         if api_key:
             self.session.headers.update({"X-MBX-APIKEY": api_key})
     
@@ -44,7 +72,7 @@ class BinanceProvider:
         ).hexdigest()
         return signature
     
-    def _get(self, base_url: str, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
+    def _get(self, base_url: str, endpoint: str, params: Dict = None, signed: bool = False) -> Optional[Dict]:
         """GET 請求"""
         url = f"{base_url}{endpoint}"
         params = params or {}
@@ -57,11 +85,16 @@ class BinanceProvider:
             resp = self.session.get(url, params=params, timeout=10)
             resp.raise_for_status()
             return resp.json()
+        except requests.Timeout:
+            raise BinanceAPIError(408, f"Timeout for {endpoint}")
+        except requests.HTTPError as e:
+            raise BinanceAPIError(e.response.status_code, str(e))
+        except requests.ConnectionError as e:
+            raise BinanceAPIError(0, f"Connection error: {e}")
         except Exception as e:
-            print(f"Error: {e}")
-            return {}
+            raise BinanceAPIError(0, f"Unexpected error: {e}")
     
-    def _post(self, base_url: str, endpoint: str, params: Dict = None, signed: bool = False) -> Dict:
+    def _post(self, base_url: str, endpoint: str, params: Dict = None, signed: bool = False) -> Optional[Dict]:
         """POST 請求"""
         url = f"{base_url}{endpoint}"
         params = params or {}
@@ -74,15 +107,20 @@ class BinanceProvider:
             resp = self.session.post(url, params=params, timeout=10)
             resp.raise_for_status()
             return resp.json()
+        except requests.Timeout:
+            raise BinanceAPIError(408, f"Timeout for {endpoint}")
+        except requests.HTTPError as e:
+            raise BinanceAPIError(e.response.status_code, str(e))
+        except requests.ConnectionError as e:
+            raise BinanceAPIError(0, f"Connection error: {e}")
         except Exception as e:
-            print(f"Error: {e}")
-            return {}
+            raise BinanceAPIError(0, f"Unexpected error: {e}")
     
     # ============================================================
     # 現貨市場數據
     # ============================================================
     
-    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 200) -> List[Dict]:
+    def get_klines(self, symbol: str, interval: str = "1h", limit: int = 200) -> List[Kline]:
         """取得 K 線數據"""
         data = self._get(self.SPOT_BASE_URL, "/api/v3/klines", {
             "symbol": symbol.upper(),
@@ -90,7 +128,10 @@ class BinanceProvider:
             "limit": limit
         })
         
-        result = []
+        if not data:
+            return []
+        
+        result: List[Kline] = []
         for k in data:
             result.append({
                 "open_time": datetime.fromtimestamp(k[0] / 1000),
@@ -146,6 +187,9 @@ class BinanceProvider:
             "limit": limit
         })
         
+        if not data:
+            return []
+        
         return [{
             "id": t["id"],
             "price": float(t["price"]),
@@ -186,13 +230,12 @@ class BinanceProvider:
     
     def get_top_long_short_ratio(self, symbol: str, period: str = "1h") -> Optional[Dict]:
         """取得多空比率"""
-        # 這個需要期貨情緒 API
         data = self._get(self.FUTURES_BASE_URL, "/fapi/fundustrade/LongShortRatio", {
             "symbol": symbol.upper(),
             "period": period
         })
         
-        if not data or len(data) == 0:
+        if not data or not isinstance(data, list) or len(data) == 0:
             return None
         
         latest = data[-1]
@@ -245,6 +288,9 @@ class BinanceProvider:
         
         data = self._get(self.SPOT_BASE_URL, "/api/v3/openOrders", params, signed=True)
         
+        if not data:
+            return []
+        
         return [{
             "symbol": o["symbol"],
             "side": o["side"],
@@ -260,24 +306,27 @@ class BinanceProvider:
     # ============================================================
     
     def get_top_symbols(self, limit: int = 20) -> List[str]:
-        """取得成交量最高的幣種"""
+        """取得成交量最高的幣種 - O(N) 優化版本"""
         data = self._get(self.SPOT_BASE_URL, "/api/v3/ticker/24hr")
         
-        if not data:
+        if not data or not isinstance(data, list):
             return ["BTCUSDT", "ETHUSDT"]
         
-        # 過濾 USDT 交易對，按成交量排序
-        symbols = [
-            s["symbol"] for s in data
-            if s["symbol"].endswith("USDT")
-            and float(s["quoteVolume"]) > 1000000  # > 100萬 USDT
-        ]
+        # O(N): 單次遍歷建立 volume map 並過濾
+        volume_map: Dict[str, float] = {}
+        symbols: List[str] = []
         
-        # 按成交量排序
-        symbols.sort(
-            key=lambda x: next((float(s["quoteVolume"]) for s in data if s["symbol"] == x), 0),
-            reverse=True
-        )
+        for s in data:
+            sym = s["symbol"]
+            if not sym.endswith("USDT"):
+                continue
+            vol = float(s.get("quoteVolume", 0))
+            if vol > 1_000_000:  # > 100萬 USDT
+                volume_map[sym] = vol
+                symbols.append(sym)
+        
+        # O(N log N): 排序
+        symbols.sort(key=lambda x: volume_map[x], reverse=True)
         
         return symbols[:limit]
     
@@ -291,7 +340,7 @@ class BinanceProvider:
         - 多空比率
         - 現貨/期貨溢價
         """
-        sentiment = {
+        sentiment: Dict = {
             "symbol": symbol,
             "funding_rate": None,
             "open_interest": None,
@@ -301,24 +350,36 @@ class BinanceProvider:
         }
         
         # 現貨 Ticker
-        sentiment["ticker"] = self.get_ticker(symbol)
+        try:
+            sentiment["ticker"] = self.get_ticker(symbol)
+        except BinanceAPIError:
+            pass
         
         # 期貨資金费率
-        sentiment["funding_rate"] = self.get_funding_rate(symbol)
+        try:
+            sentiment["funding_rate"] = self.get_funding_rate(symbol)
+        except BinanceAPIError:
+            pass
         
         # 未平倉量
-        oi = self.get_open_interest(symbol)
-        if oi:
-            sentiment["open_interest"] = oi["open_interest"]
+        try:
+            oi = self.get_open_interest(symbol)
+            if oi:
+                sentiment["open_interest"] = oi["open_interest"]
+        except BinanceAPIError:
+            pass
         
         # 掛單簿失衡
-        ob = self.get_orderbook(symbol, 50)
-        if ob:
-            bid_total = sum(q for _, q in ob["bids"])
-            ask_total = sum(q for _, q in ob["asks"])
-            if bid_total + ask_total > 0:
-                imbalance = (bid_total - ask_total) / (bid_total + ask_total)
-                sentiment["orderbook_imbalance"] = imbalance
+        try:
+            ob = self.get_orderbook(symbol, 50)
+            if ob and ob.get("bids") and ob.get("asks"):
+                bid_total = sum(q for _, q in ob["bids"])
+                ask_total = sum(q for _, q in ob["asks"])
+                if bid_total + ask_total > 0:
+                    imbalance = (bid_total - ask_total) / (bid_total + ask_total)
+                    sentiment["orderbook_imbalance"] = imbalance
+        except BinanceAPIError:
+            pass
         
         return sentiment
 
@@ -329,8 +390,26 @@ class BinanceProvider:
 
 def create_binance_provider() -> BinanceProvider:
     """使用儲存的 API Key 建立 Provider"""
+    key_path = os.path.expanduser("~/.openclaw/credentials/binance.key")
+    
+    # 檢查檔案權限
     try:
-        with open("/home/snow/.openclaw/credentials/binance.key") as f:
+        stat = os.stat(key_path)
+        mode = stat.st_mode & 0o777
+        if mode & 0o077:  # 群組或其他人有讀寫權限
+            print(f"Warning: {key_path} has insecure permissions {oct(mode)}")
+    except FileNotFoundError:
+        print(f"Warning: {key_path} not found")
+        return BinanceProvider()
+    except PermissionError:
+        print(f"Warning: Permission denied: {key_path}")
+        return BinanceProvider()
+    except OSError as e:
+        print(f"Warning: Failed to check {key_path}: {e}")
+        return BinanceProvider()
+    
+    try:
+        with open(key_path) as f:
             lines = f.readlines()
         
         api_key = None
