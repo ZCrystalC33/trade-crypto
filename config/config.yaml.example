@@ -1,12 +1,14 @@
-# TRADE-Crypto Configuration
+# TRADE-Crypto Configuration Template
+# 複製此檔案為 config.yaml 並填入真實值
 
 freqtrade:
   api_url: "http://127.0.0.1:18798"
   username: "freqtrade"
-  password: "freqtrade123"
+  password: "${FREQTRADE_PASSWORD}"  # 從環境變數讀取
 
 binance:
   base_url: "https://api.binance.com/api/v3"
+  # API Key 從 ~/.openclaw/credentials/binance.key 讀取
 
 scanning:
   symbols:

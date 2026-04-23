@@ -2,3 +2,11 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+
+# Credentials & Config
+config/config.yaml
+config/config.yaml.bak
+~/.openclaw/credentials/
+*.key
+*.pem
+*.crt
